@@ -9,6 +9,10 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg?style=for-the-badge&color=007b80)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/github/license/4x3/Vertex?style=for-the-badge&color=007b80)](https://opensource.org/licenses/MIT)
 
+<br>
+
+<img src="screenshot.png" alt="Vertex CLI Preview" width="800">
+
 </div>
 
 <br>
