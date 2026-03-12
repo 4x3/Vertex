@@ -71,6 +71,10 @@ To enable verbose debug logging (useful for troubleshooting proxy connections or
 
     python vertex.py --verbose
 
+## Acknowledgments
+
+Vertex is an upgraded and heavily expanded iteration of [Scout](https://github.com/kiryano/scout), originally created by [kiryano](https://github.com/kiryano). Huge thanks to him for the foundational architecture and initial concept that made this project possible!
+
 ## Disclaimer
 
 Vertex is developed for educational and research purposes. Scraping social media platforms may violate their respective Terms of Service. The developers of Vertex are not responsible for any misuse, account bans, or IP blacklisting that may occur. Please use responsibly and ensure you have permission to extract data from target domains.
