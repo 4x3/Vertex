@@ -4,7 +4,7 @@ import smtplib
 import socket
 import logging
 import threading
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -15,10 +15,14 @@ from app.scrapers.stealth import random_user_agent, random_delay
 logger = logging.getLogger(__name__)
 
 EMAIL_RE = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-EMAIL_BLACKLIST = ['example.com', 'test.com', 'email.com', 'youremail.com',
-                   'sentry.io', 'wixpress.com', 'googleapis.com', 'w3.org',
-                   'schema.org', 'gravatar.com', 'wordpress.com']
-FILE_EXT_BLACKLIST = ['.png', '.jpg', '.gif', '.css', '.js', '.svg', '.webp', '.ico']
+EMAIL_BLACKLIST = {
+    'example.com', 'test.com', 'email.com', 'youremail.com',
+    'sentry.io', 'wixpress.com', 'googleapis.com', 'w3.org',
+    'schema.org', 'gravatar.com', 'wordpress.com', 'sentry.wixpress.com',
+}
+FILE_EXT_BLACKLIST = (
+    '.png', '.jpg', '.jpeg', '.gif', '.css', '.js', '.svg', '.webp', '.ico',
+)
 
 
 class LeadEnricher:
@@ -27,6 +31,13 @@ class LeadEnricher:
         self.hunter_api_key = hunter_api_key
         self._domain_pattern_cache: Dict[str, Optional[str]] = {}
         self._cache_lock = threading.Lock()
+        self.http_client = httpx.Client(timeout=10.0, follow_redirects=True)
+
+    def close(self):
+        try:
+            self.http_client.close()
+        except Exception:
+            pass
 
     def enrich_lead(self, lead_data: Dict) -> Dict:
         enriched = lead_data.copy()
@@ -41,9 +52,11 @@ class LeadEnricher:
         website = lead_data.get('website', '')
         site_emails = []
 
-        useless_domains = ['youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com',
-                           'twitter.com', 'x.com', 'facebook.com', 'linktr.ee',
-                           'stan.store', 'beacons.ai', 'bit.ly', 'spotify.com']
+        useless_domains = [
+            'youtube.com', 'youtu.be', 'instagram.com', 'tiktok.com',
+            'twitter.com', 'x.com', 'facebook.com', 'linktr.ee',
+            'stan.store', 'beacons.ai', 'bit.ly', 'spotify.com',
+        ]
         website_is_useful = website and not any(d in website.lower() for d in useless_domains)
 
         if website_is_useful:
@@ -69,37 +82,33 @@ class LeadEnricher:
                         enriched['phone'] = site_info['phone']
 
         work_domain = company_domain or (self._extract_domain(website) if website_is_useful else None)
+        full_name = lead_data.get('full_name')
 
-        if lead_data.get('full_name') and work_domain:
-            pattern_email = self._predict_email_from_pattern(
-                lead_data['full_name'], 'https://' + work_domain, site_emails
-            )
+        if full_name and work_domain:
+            pattern_email = self._predict_email_from_pattern(full_name, work_domain, site_emails)
             if pattern_email:
                 email_candidates.append((pattern_email, 'pattern'))
 
-        if not email_candidates and lead_data.get('full_name') and work_domain:
-            candidates = self._generate_email_candidates(lead_data['full_name'], 'https://' + work_domain)
+        if not email_candidates and full_name and work_domain:
+            candidates = self._generate_email_candidates(full_name, work_domain)
             for c in candidates[:5]:
                 smtp = self._verify_email_smtp(c)
                 if smtp['exists'] and not smtp['accept_all']:
                     email_candidates.append((c, 'smtp_guess'))
                     break
 
-        if self.hunter_api_key and lead_data.get('full_name') and website:
-            hunter_email = self._find_with_hunter(
-                lead_data.get('full_name'), website
-            )
+        if self.hunter_api_key and full_name and work_domain:
+            hunter_email = self._find_with_hunter(full_name, work_domain)
             if hunter_email:
                 email_candidates.append((hunter_email, 'hunter.io'))
 
         bio_links = self._extract_bio_links(lead_data.get('bio', ''))
-        if bio_links:
-            for link in bio_links[:3]:
-                link_info = self._scrape_link_page(link)
-                if link_info['email']:
-                    email_candidates.append((link_info['email'], 'bio_link'))
-                if link_info['phone'] and not enriched.get('phone'):
-                    enriched['phone'] = link_info['phone']
+        for link in bio_links[:3]:
+            link_info = self._scrape_link_page(link)
+            if link_info['email']:
+                email_candidates.append((link_info['email'], 'bio_link'))
+            if link_info['phone'] and not enriched.get('phone'):
+                enriched['phone'] = link_info['phone']
 
         if email_candidates:
             seen = set()
@@ -115,8 +124,7 @@ class LeadEnricher:
             for email, source in unique:
                 scored = self._score_and_verify_email(
                     email, source,
-                    pattern_match=(source == 'pattern'),
-                    site_emails_count=len(site_emails)
+                    site_emails_count=len(site_emails),
                 )
                 if scored['score'] > best_score:
                     best_score = scored['score']
@@ -128,10 +136,8 @@ class LeadEnricher:
                 enriched['email_source'] = best['source']
                 enriched['email_verified'] = best['verified']
 
-        if not enriched.get('email') and lead_data.get('full_name') and work_domain:
-            enriched['possible_emails'] = self._generate_email_candidates(
-                lead_data['full_name'], 'https://' + work_domain
-            )
+        if not enriched.get('email') and full_name and work_domain:
+            enriched['possible_emails'] = self._generate_email_candidates(full_name, work_domain)
 
         enriched['lead_score'] = self._calculate_lead_score(enriched)
         return enriched
@@ -154,7 +160,8 @@ class LeadEnricher:
 
     def _is_valid_email(self, email: str) -> bool:
         lower = email.lower()
-        if any(b in lower for b in EMAIL_BLACKLIST):
+        domain = lower.split('@')[-1]
+        if domain in EMAIL_BLACKLIST:
             return False
         if any(lower.endswith(ext) for ext in FILE_EXT_BLACKLIST):
             return False
@@ -172,8 +179,7 @@ class LeadEnricher:
             if 10 <= len(num) <= 15:
                 return '+' + num
 
-        visible = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-        visible = re.sub(r'<style[^>]*>.*?</style>', '', visible, flags=re.DOTALL)
+        visible = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', text, flags=re.DOTALL)
         visible = re.sub(r'<[^>]+>', ' ', visible)
         visible = re.sub(r'\s+', ' ', visible)
 
@@ -196,9 +202,9 @@ class LeadEnricher:
         try:
             if not url.startswith('http'):
                 url = 'https://' + url
-            resp = httpx.get(url, timeout=10, headers={
-                'User-Agent': random_user_agent()
-            }, follow_redirects=True)
+            resp = self.http_client.get(url, headers={
+                'User-Agent': random_user_agent(),
+            })
             if resp.status_code == 200:
                 return resp.text
         except Exception as e:
@@ -211,12 +217,13 @@ class LeadEnricher:
         if not website.startswith('http'):
             website = 'https://' + website
 
+        base = website.rstrip('/')
         pages_to_check = [
-            website,
-            website.rstrip('/') + '/contact',
-            website.rstrip('/') + '/contact-us',
-            website.rstrip('/') + '/about',
-            website.rstrip('/') + '/about-us',
+            base,
+            base + '/contact',
+            base + '/contact-us',
+            base + '/about',
+            base + '/about-us',
         ]
 
         all_emails = []
@@ -246,34 +253,30 @@ class LeadEnricher:
         result['all_emails'] = list(set(all_emails))
         return result
 
-    def _predict_email_from_pattern(self, full_name: str, website: str,
+    def _predict_email_from_pattern(self, full_name: str, domain: str,
                                      site_emails: List[str]) -> Optional[str]:
-        domain = self._extract_domain(website)
-        if not domain:
-            return None
-
         parts = full_name.lower().strip().split()
         if len(parts) < 2:
             return None
 
         first, last = parts[0], parts[-1]
 
-        domain_emails = [e for e in site_emails if e.lower().endswith('@' + domain)]
-        if not domain_emails:
+        with self._cache_lock:
+            cached = self._domain_pattern_cache.get(domain)
+
+        if not cached:
+            domain_emails = [e for e in site_emails if e.lower().endswith('@' + domain)]
+            if not domain_emails:
+                return None
+            local = domain_emails[0].lower().split('@')[0]
+            cached = self._detect_pattern(local)
+            with self._cache_lock:
+                self._domain_pattern_cache[domain] = cached
+
+        if not cached:
             return None
 
-        sample = domain_emails[0].lower()
-        local = sample.split('@')[0]
-
-        pattern = self._detect_pattern(local)
-        if not pattern:
-            return None
-
-        predicted = self._apply_pattern(pattern, first, last, domain)
-        if predicted and predicted.lower() not in [e.lower() for e in domain_emails]:
-            return predicted
-
-        return predicted
+        return self._apply_pattern(cached, first, last, domain)
 
     def _detect_pattern(self, local_part: str) -> Optional[str]:
         if '.' in local_part:
@@ -314,10 +317,10 @@ class LeadEnricher:
         result['score'] += 10
 
         try:
-            with smtplib.SMTP(timeout=10) as smtp:
+            with smtplib.SMTP(timeout=8) as smtp:
                 smtp.connect(mx_host, 25)
-                smtp.helo('scout-verify.local')
-                smtp.mail('verify@scout-verify.local')
+                smtp.helo('mail-check.local')
+                smtp.mail('verify@mail-check.local')
                 code, msg = smtp.rcpt(email)
 
                 if code == 250:
@@ -338,24 +341,19 @@ class LeadEnricher:
         return result
 
     def _score_and_verify_email(self, email: str, source: str,
-                                 pattern_match: bool = False,
                                  site_emails_count: int = 0) -> Dict:
-        score = 0
+        score_map = {
+            'bio': 90,
+            'hunter.io': 80,
+            'website': 70,
+            'smtp_guess': 70,
+            'bio_link': 65,
+            'contact_page': 60,
+            'pattern': 40,
+        }
+        score = score_map.get(source, 50)
 
-        if source == 'bio':
-            score += 90
-        elif source == 'website':
-            score += 70
-        elif source == 'contact_page':
-            score += 60
-        elif source == 'hunter.io':
-            score += 80
-        elif source == 'smtp_guess':
-            score += 70
-        elif source == 'bio_link':
-            score += 65
-        elif source == 'pattern':
-            score += 40
+        if source == 'pattern':
             if site_emails_count >= 3:
                 score += 15
             elif site_emails_count >= 1:
@@ -369,7 +367,7 @@ class LeadEnricher:
 
         return {
             'email': email,
-            'score': min(score, 100),
+            'score': min(max(score, 0), 100),
             'source': source,
             'verified': smtp_result['exists'],
             'accept_all': smtp_result['accept_all'],
@@ -387,7 +385,6 @@ class LeadEnricher:
     def _find_company_domain(self, lead_data: Dict) -> Optional[str]:
         company = lead_data.get('company', '')
         headline = lead_data.get('headline', '')
-        bio = lead_data.get('bio', '')
 
         company_names = []
 
@@ -438,7 +435,7 @@ class LeadEnricher:
 
         if ' ' in clean:
             parts = clean.split()
-            if len(parts) == 2:
+            if len(parts) >= 2:
                 guesses.append(f'{parts[0]}{parts[1]}.com')
 
         for domain in guesses:
@@ -450,11 +447,7 @@ class LeadEnricher:
 
         return None
 
-    def _generate_email_candidates(self, full_name: str, website: str) -> List[str]:
-        domain = self._extract_domain(website)
-        if not domain:
-            return []
-
+    def _generate_email_candidates(self, full_name: str, domain: str) -> List[str]:
         parts = full_name.lower().strip().split()
         if len(parts) < 2:
             return []
@@ -504,25 +497,21 @@ class LeadEnricher:
 
         return result
 
-    def _find_with_hunter(self, full_name: Optional[str], website: Optional[str]) -> Optional[str]:
-        if not self.hunter_api_key or not full_name or not website:
+    def _find_with_hunter(self, full_name: Optional[str], domain: Optional[str]) -> Optional[str]:
+        if not self.hunter_api_key or not full_name or not domain:
             return None
 
         try:
-            domain = self._extract_domain(website)
-            if not domain:
-                return None
-
             parts = full_name.split()
             if len(parts) < 2:
                 return None
 
-            resp = httpx.get('https://api.hunter.io/v2/email-finder', params={
+            resp = self.http_client.get('https://api.hunter.io/v2/email-finder', params={
                 'domain': domain,
                 'first_name': parts[0],
                 'last_name': parts[-1],
                 'api_key': self.hunter_api_key,
-            }, timeout=10)
+            })
 
             data = resp.json()
             if data.get('data', {}).get('email'):
@@ -581,4 +570,7 @@ class LeadEnricher:
 
 def enrich_lead(lead_data: Dict, hunter_api_key: Optional[str] = None) -> Dict:
     enricher = LeadEnricher(hunter_api_key=hunter_api_key)
-    return enricher.enrich_lead(lead_data)
+    try:
+        return enricher.enrich_lead(lead_data)
+    finally:
+        enricher.close()
