@@ -2,9 +2,11 @@ import random
 import time
 import os
 import logging
-import requests
 from typing import Optional, Callable
 from functools import wraps
+
+import httpx
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,18 @@ def random_user_agent() -> str:
 
 def random_delay(min_seconds: float = 1.5, max_seconds: float = 4.5):
     time.sleep(random.uniform(min_seconds, max_seconds))
+
+
+def _env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, '').strip()
+        if value:
+            return value
+    return ''
+
+
+def _truthy(value: str) -> bool:
+    return value.lower() in ('1', 'true', 'yes')
 
 
 def _fetch_free_proxies() -> list:
@@ -65,18 +79,19 @@ def _fetch_free_proxies() -> list:
 
 
 def get_proxy() -> Optional[str]:
-    proxy = os.environ.get('SCOUT_PROXY')
+    proxy = _env('VERTEX_PROXY', 'SCOUT_PROXY')
     if proxy:
         return proxy
 
-    proxy_file = os.environ.get('SCOUT_PROXY_FILE')
+    proxy_file = _env('VERTEX_PROXY_FILE', 'SCOUT_PROXY_FILE')
     if proxy_file and os.path.exists(proxy_file):
         with open(proxy_file, 'r') as f:
             proxies = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         if proxies:
             return random.choice(proxies)
 
-    if os.environ.get('SCOUT_FREE_PROXY', '').lower() in ('1', 'true', 'yes'):
+    free_flag = _env('VERTEX_FREE_PROXY', 'SCOUT_FREE_PROXY')
+    if _truthy(free_flag):
         free_proxies = _fetch_free_proxies()
         if free_proxies:
             return random.choice(free_proxies)
@@ -102,25 +117,36 @@ def get_requests_proxies() -> Optional[dict]:
     return {'http': proxy, 'https': proxy}
 
 
+def make_client(timeout: float = 20.0, **kwargs) -> httpx.Client:
+    """httpx client wired to the current proxy, if any."""
+    kwargs.setdefault('timeout', timeout)
+    kwargs.setdefault('follow_redirects', True)
+    proxy = get_httpx_proxy()
+    if proxy:
+        kwargs['proxy'] = proxy
+    return httpx.Client(**kwargs)
+
+
 def proxy_status() -> str:
-    if os.environ.get('SCOUT_PROXY'):
+    if _env('VERTEX_PROXY', 'SCOUT_PROXY'):
         return 'custom'
-    if os.environ.get('SCOUT_PROXY_FILE'):
+    if _env('VERTEX_PROXY_FILE', 'SCOUT_PROXY_FILE'):
         return 'file'
-    if os.environ.get('SCOUT_FREE_PROXY', '').lower() in ('1', 'true', 'yes'):
+    if _truthy(_env('VERTEX_FREE_PROXY', 'SCOUT_FREE_PROXY')):
         return 'free'
     return 'none'
 
 
 def test_proxy() -> bool:
     """Test if current proxy is working."""
-    proxy = get_requests_proxies()
+    proxy = get_httpx_proxy()
     if not proxy:
         return True
 
     try:
-        r = requests.get('https://httpbin.org/ip', proxies=proxy, timeout=10)
-        return r.status_code == 200
+        with httpx.Client(proxy=proxy, timeout=10) as client:
+            r = client.get('https://httpbin.org/ip')
+            return r.status_code == 200
     except Exception:
         return False
 
@@ -134,21 +160,20 @@ def retry_request(max_retries: int = 3, delay: float = 2.0):
             for attempt in range(max_retries):
                 try:
                     return func(*args, **kwargs)
-                except requests.exceptions.ProxyError as e:
+                except (httpx.ProxyError, requests.exceptions.ProxyError) as e:
                     last_error = e
                     logger.warning(f"Proxy error (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-                except requests.exceptions.Timeout as e:
+                except (httpx.TimeoutException, requests.exceptions.Timeout) as e:
                     last_error = e
                     logger.warning(f"Timeout (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
-                except requests.exceptions.ConnectionError as e:
+                except (httpx.ConnectError, requests.exceptions.ConnectionError) as e:
                     last_error = e
                     logger.warning(f"Connection error (attempt {attempt + 1}/{max_retries})")
-                    if attempt < max_retries - 1:
-                        time.sleep(delay)
+                except httpx.HTTPError as e:
+                    last_error = e
+                    logger.warning(f"HTTP error (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    time.sleep(delay)
             logger.error(f"All {max_retries} attempts failed: {last_error}")
             return None
         return wrapper

@@ -1,4 +1,4 @@
-# Proxy file for Scout
+# Proxy file for Vertex
 # One proxy per line in the format: http://username:password@host:port
 # Lines starting with # are ignored
 
