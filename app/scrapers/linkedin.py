@@ -1,13 +1,11 @@
 import json
 import logging
 import os
-import re
-from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Optional
 
 import httpx
 
-from app.scrapers.stealth import random_user_agent, get_httpx_proxy
+from app.scrapers.stealth import random_user_agent, make_client
 from app.scrapers.utils import extract_email
 
 logger = logging.getLogger(__name__)
@@ -31,16 +29,16 @@ def validate_cookie() -> dict:
         return {'valid': False, 'message': 'No cookie set'}
 
     try:
-        client = httpx.Client(follow_redirects=True, timeout=15)
-        client.cookies.set('li_at', cookie, domain='.linkedin.com')
-        resp = client.get('https://www.linkedin.com/feed/')
+        with make_client(timeout=15) as client:
+            client.cookies.set('li_at', cookie, domain='.linkedin.com')
+            resp = client.get('https://www.linkedin.com/feed/')
 
-        if resp.status_code == 200 and 'feed' in str(resp.url):
-            return {'valid': True, 'message': 'Cookie is valid'}
-        elif 'login' in str(resp.url) or 'authwall' in str(resp.url):
-            return {'valid': False, 'message': 'Cookie expired - please re-export'}
-        else:
-            return {'valid': False, 'message': f'Unexpected response: {resp.status_code}'}
+            if resp.status_code == 200 and 'feed' in str(resp.url):
+                return {'valid': True, 'message': 'Cookie is valid'}
+            elif 'login' in str(resp.url) or 'authwall' in str(resp.url):
+                return {'valid': False, 'message': 'Cookie expired - please re-export'}
+            else:
+                return {'valid': False, 'message': f'Unexpected response: {resp.status_code}'}
     except Exception as e:
         return {'valid': False, 'message': f'Connection error: {str(e)}'}
 
@@ -53,10 +51,18 @@ def _get_session():
     if not cookie:
         return None, None
 
-    client = httpx.Client(follow_redirects=True, timeout=20)
+    client = make_client()
     client.cookies.set('li_at', cookie, domain='.linkedin.com')
 
-    resp = client.get('https://www.linkedin.com/feed/')
+    try:
+        client.get(
+            'https://www.linkedin.com/feed/',
+            headers={'User-Agent': random_user_agent()},
+        )
+    except Exception as e:
+        logger.error(f"Error initializing LinkedIn session: {e}")
+        client.close()
+        return None, None
 
     csrf = None
     for c in client.cookies.jar:
@@ -66,6 +72,7 @@ def _get_session():
 
     if not csrf:
         logger.error("Could not extract CSRF token from LinkedIn")
+        client.close()
         return None, None
 
     _session_cache['client'] = client
@@ -80,6 +87,11 @@ def scrape_linkedin_profile(username: str) -> Optional[Dict]:
         logger.error("LINKEDIN_COOKIE not set in .env")
         return None
 
+    username = username.strip().rstrip('/')
+    if '/in/' in username:
+        username = username.split('/in/')[-1]
+    username = username.lstrip('@').strip()
+
     client, csrf = _get_session()
     if not client or not csrf:
         logger.error("Failed to initialize LinkedIn session. Cookie may be expired.")
@@ -92,9 +104,13 @@ def scrape_linkedin_profile(username: str) -> Optional[Dict]:
         'Accept': 'application/vnd.linkedin.normalized+json+2.1',
         'x-li-lang': 'en_US',
         'x-restli-protocol-version': '2.0.0',
+        'User-Agent': random_user_agent(),
     }
 
-    url = f'https://www.linkedin.com/voyager/api/identity/dash/profiles?q=memberIdentity&memberIdentity={username}'
+    url = (
+        'https://www.linkedin.com/voyager/api/identity/dash/profiles'
+        f'?q=memberIdentity&memberIdentity={username}'
+    )
 
     try:
         resp = client.get(url, headers=headers)
@@ -106,6 +122,11 @@ def scrape_linkedin_profile(username: str) -> Optional[Dict]:
         logger.error(f"Profile {username} is restricted or not accessible")
         return None
     if resp.status_code == 401:
+        if _session_cache['client']:
+            try:
+                _session_cache['client'].close()
+            except Exception:
+                pass
         _session_cache.update({'client': None, 'csrf': None})
         logger.error("LinkedIn cookie expired. Re-export your li_at cookie.")
         return None
@@ -120,10 +141,24 @@ def scrape_linkedin_profile(username: str) -> Optional[Dict]:
         return None
 
     profile_data = None
+    current_company = ''
+    location = ''
+    follower_count = 0
+
     for item in data.get('included', []):
-        if 'firstName' in item and 'lastName' in item:
+        if 'firstName' in item and 'lastName' in item and not profile_data:
             profile_data = item
-            break
+
+        if item.get('$type') == 'com.linkedin.voyager.dash.profile.Position' and not current_company:
+            end = (item.get('dateRange') or {}).get('end')
+            if not end:
+                current_company = item.get('companyName', '') or ''
+
+        if item.get('$type') == 'com.linkedin.voyager.dash.profile.Profile':
+            location = item.get('locationName', '') or location
+
+        if item.get('$type') == 'com.linkedin.voyager.dash.identity.profile.ProfileNetworkInfo':
+            follower_count = item.get('followersCount', 0) or follower_count
 
     if not profile_data:
         logger.error(f"No profile data found for {username}")
@@ -145,6 +180,9 @@ def scrape_linkedin_profile(username: str) -> Optional[Dict]:
         'full_name': f"{profile_data.get('firstName', '')} {profile_data.get('lastName', '')}".strip(),
         'headline': profile_data.get('headline', ''),
         'bio': summary,
+        'company': current_company,
+        'location': location,
+        'follower_count': follower_count,
         'profile_url': f"https://www.linkedin.com/in/{profile_data.get('publicIdentifier', username)}/",
         'is_verified': profile_data.get('showVerificationBadge', False),
         'is_premium': profile_data.get('premium', False),
