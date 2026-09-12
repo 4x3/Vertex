@@ -15,13 +15,14 @@ Features:
 - Can scrape all supported platforms at once via scrape_all()
 """
 
-import requests
-from typing import Dict, Optional, List
+import json
 import logging
 import re
-import json
+from typing import Dict, Optional, List
 
-from app.scrapers.stealth import random_user_agent
+import httpx
+
+from app.scrapers.stealth import random_user_agent, make_client
 from app.scrapers.utils import extract_email as _shared_extract_email
 
 logger = logging.getLogger(__name__)
@@ -86,36 +87,36 @@ def _scrape_profile(username: str, platform: str) -> Optional[Dict]:
     }
 
     try:
-        r = requests.get(url, headers=headers, timeout=20)
+        with make_client(timeout=15) as client:
+            r = client.get(url, headers=headers)
 
-        if r.status_code == 404:
-            logger.debug(f"{platform} user {username} not found")
-            return None
+            if r.status_code == 404:
+                logger.debug(f"{platform} user {username} not found")
+                return None
 
-        if r.status_code != 200:
-            logger.error(f"{platform} error {r.status_code} for {username}")
-            return None
+            if r.status_code != 200:
+                logger.error(f"{platform} error {r.status_code} for {username}")
+                return None
 
-        html = r.text
+            html = r.text
 
-        if platform == 'linktree':
-            return _parse_linktree(html, username)
-        elif platform == 'stan':
-            return _parse_stan(html, username)
-        else:
-            return _parse_generic(html, username, platform)
+            if platform == 'linktree':
+                return _parse_linktree(html, username)
+            elif platform == 'stan':
+                return _parse_stan(html, username)
+            else:
+                return _parse_generic(html, username, platform)
 
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         logger.error(f"Timeout fetching {platform} profile {username}")
         return None
-    except requests.exceptions.RequestException as e:
+    except httpx.RequestError as e:
         logger.error(f"Error fetching {platform} profile {username}: {e}")
         return None
 
 
 def _parse_linktree(html: str, username: str) -> Optional[Dict]:
     """Parse Linktree page."""
-
     data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
     if not data_match:
         return _parse_generic(html, username, 'linktree')
@@ -136,20 +137,7 @@ def _parse_linktree(html: str, username: str) -> Optional[Dict]:
                 })
 
         bio = account.get('description', '')
-
-        return {
-            'username': username,
-            'full_name': account.get('pageTitle', ''),
-            'bio': bio,
-            'email': _extract_email_from_links(links) or _extract_email(bio),
-            'follower_count': 0,
-            'website': _extract_website(links),
-            'links': links,
-            'link_count': len(links),
-            'socials': _extract_socials(links),
-            'platform': 'linktree',
-            'profile_url': f'https://linktr.ee/{username}',
-        }
+        return _build_profile(username, account.get('pageTitle', ''), bio, links, 'linktree')
 
     except json.JSONDecodeError:
         return _parse_generic(html, username, 'linktree')
@@ -157,6 +145,22 @@ def _parse_linktree(html: str, username: str) -> Optional[Dict]:
 
 def _parse_stan(html: str, username: str) -> Optional[Dict]:
     """Parse Stan.store page."""
+    data_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+    if data_match:
+        try:
+            data = json.loads(data_match.group(1))
+            store = data.get('props', {}).get('pageProps', {}).get('store', {})
+            links = []
+            for product in store.get('products', []) or []:
+                url = product.get('externalUrl')
+                if url:
+                    links.append({'title': product.get('title', ''), 'url': url})
+            full_name = store.get('name', '')
+            bio = store.get('description', '')
+            if full_name or links:
+                return _build_profile(username, full_name, bio, links, 'stan')
+        except json.JSONDecodeError:
+            pass
 
     links = []
     link_matches = re.findall(r'href="(https?://[^"]+)"', html)
@@ -173,24 +177,11 @@ def _parse_stan(html: str, username: str) -> Optional[Dict]:
     if not full_name and not links:
         return None
 
-    return {
-        'username': username,
-        'full_name': full_name,
-        'bio': bio,
-        'email': _extract_email_from_links(links) or _extract_email(bio),
-        'follower_count': 0,
-        'website': _extract_website(links),
-        'links': links[:20],
-        'link_count': len(links),
-        'socials': _extract_socials(links),
-        'platform': 'stan',
-        'profile_url': f'https://stan.store/{username}',
-    }
+    return _build_profile(username, full_name, bio, links, 'stan')
 
 
 def _parse_generic(html: str, username: str, platform: str) -> Optional[Dict]:
     """Generic parser for link-in-bio pages."""
-
     links = []
     link_matches = re.findall(r'href="(https?://[^"]+)"', html)
 
@@ -201,18 +192,21 @@ def _parse_generic(html: str, username: str, platform: str) -> Optional[Dict]:
             seen.add(url)
 
     title_match = re.search(r'<title>([^<]+)</title>', html)
-    full_name = title_match.group(1).strip() if title_match else ''
+    full_name = title_match.group(1).split('|')[0].strip() if title_match else ''
 
     bio = ''
-    meta_desc = re.search(r'<meta[^>]*name="description"[^>]*content="([^"]*)"', html)
+    meta_desc = re.search(r'<meta[^>]*name="description"[^>]*content="([^"]*)"', html, re.IGNORECASE)
     if meta_desc:
         bio = meta_desc.group(1)
 
-    if not links:
+    if not links and not full_name:
         return None
 
-    base_url = PLATFORMS.get(platform, '').format(username=username)
+    return _build_profile(username, full_name, bio, links, platform)
 
+
+def _build_profile(username: str, full_name: str, bio: str, links: List[Dict], platform: str) -> Dict:
+    base_url = PLATFORMS.get(platform, '').format(username=username)
     return {
         'username': username,
         'full_name': full_name,
@@ -245,13 +239,17 @@ def _extract_socials(links: List[Dict]) -> Dict[str, str]:
         'soundcloud': r'soundcloud\.com/([^/?]+)',
     }
 
+    skip_handles = {'share', 'intent', 'post', 'watch', 'explore'}
+
     for link in links:
         url = link.get('url', '')
         for platform, pattern in patterns.items():
             if platform not in socials:
                 match = re.search(pattern, url, re.IGNORECASE)
                 if match:
-                    socials[platform] = match.group(1)
+                    handle = match.group(1)
+                    if handle.lower() not in skip_handles:
+                        socials[platform] = handle
 
     return socials
 
@@ -263,7 +261,7 @@ def _extract_website(links: List[Dict]) -> str:
         'youtube.com', 'twitch.tv', 'github.com', 'linkedin.com',
         'discord.gg', 'discord.com', 'spotify.com', 'soundcloud.com',
         'facebook.com', 'pinterest.com', 'snapchat.com', 'reddit.com',
-        'stan.store', 'linktr.ee', 'linkr.bio', 'bio.link',
+        'stan.store', 'linktr.ee', 'linkr.bio', 'bio.link', 'wa.me',
     ]
     for link in links:
         url = link.get('url', '')
@@ -277,8 +275,8 @@ def _extract_email_from_links(links: List[Dict]) -> str:
     """Extract email from mailto links."""
     for link in links:
         url = link.get('url', '')
-        if url.startswith('mailto:'):
-            return url.replace('mailto:', '').split('?')[0]
+        if url.lower().startswith('mailto:'):
+            return url.split(':', 1)[1].split('?')[0].strip()
     return ''
 
 
