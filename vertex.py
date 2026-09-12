@@ -26,12 +26,12 @@ _args = [a for a in sys.argv[1:] if a not in ('--verbose', '-V')]
 if _args:
     arg = _args[0].lower()
     if arg in ('--version', '-v', 'version'):
-        print(f"Scout v{__version__}")
+        print(f"Vertex v{__version__}")
         sys.exit(0)
     elif arg in ('--help', '-h', 'help'):
-        print(f"Scout v{__version__} - Social media lead generation tool")
+        print(f"Vertex v{__version__} - Social media lead generation tool")
         print()
-        print("Usage: python scout.py [options]")
+        print("Usage: python vertex.py [options]")
         print()
         print("Options:")
         print("  --version, -v    Show version")
@@ -54,9 +54,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, MofNCompleteColumn, TimeRemainingColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import box
-from rich.layout import Layout
 from rich.text import Text
 from rich.theme import Theme
 from rich.rule import Rule
@@ -64,21 +63,23 @@ from rich.rule import Rule
 from app.scrapers.instagram import scrape_profile_no_login
 from app.scrapers.stealth import random_delay, proxy_status
 
-ACCENT = "#a70947"
-ACCENT_DIM = "#6b0530"
-ACCENT_LIGHT = "#d64d7a"
-ACCENT_MUTED = "#4a0727"
+ACCENT = "#5b8def"
+ACCENT_DIM = "#3a5fa0"
+ACCENT_LIGHT = "#8bb0ff"
+ACCENT_MUTED = "#24365c"
 
-_GRAD_START = (255, 107, 157)
-_GRAD_END = (167, 9, 71)
+_GRAD_START = (140, 180, 255)
+_GRAD_END = (70, 110, 200)
 
 _LOGO_LINES = [
-    "███████  ██████  ██████  ██  ██ ████████",
-    "██      ██      ██    ██ ██  ██    ██   ",
-    "███████ ██      ██    ██ ██  ██    ██   ",
-    "     ██ ██      ██    ██ ██  ██    ██   ",
-    "███████  ██████  ██████   ████     ██   ",
+    "██    ██ ███████ ██████  ████████ ███████ ██   ██",
+    "██    ██ ██      ██   ██    ██    ██       ██ ██ ",
+    "██    ██ █████   ██████     ██    █████     ███  ",
+    " ██  ██  ██      ██   ██    ██    ██       ██ ██ ",
+    "  ████   ███████ ██   ██    ██    ███████ ██   ██",
 ]
+
+REPO_URL = "github.com/4x3/Vertex"
 
 _session_stats = {"scraped": 0}
 _update_cache = {"checked": False, "latest": None}
@@ -94,7 +95,7 @@ def _check_for_updates():
     try:
         import requests as _req
         resp = _req.get(
-            "https://api.github.com/repos/kiryano/Scout/releases/latest",
+            "https://api.github.com/repos/4x3/Vertex/releases/latest",
             headers={"Accept": "application/vnd.github.v3+json"},
             timeout=3,
         )
@@ -182,19 +183,22 @@ def enrich_profiles(profiles):
         task = progress.add_task("[white]Enriching leads...", total=len(profiles))
 
         enriched = []
-        for p in profiles:
-            had_email = bool(p.get('email'))
-            had_phone = bool(p.get('phone'))
+        try:
+            for p in profiles:
+                had_email = bool(p.get('email'))
+                had_phone = bool(p.get('phone'))
 
-            result = enricher.enrich_lead(p)
-            enriched.append(result)
+                result = enricher.enrich_lead(p)
+                enriched.append(result)
 
-            if result.get('email') and not had_email:
-                emails_found += 1
-            if result.get('phone') and not had_phone:
-                phones_found += 1
+                if result.get('email') and not had_email:
+                    emails_found += 1
+                if result.get('phone') and not had_phone:
+                    phones_found += 1
 
-            progress.advance(task)
+                progress.advance(task)
+        finally:
+            enricher.close()
 
     console.print()
 
@@ -393,7 +397,7 @@ def show_header():
     else:
         proxy_str = "[dim]○ off[/dim]"
 
-    status = f"[dim]github.com/kiryano/Scout[/dim]  ·  [dim]Proxy:[/dim] {proxy_str}"
+    status = f"[dim]{REPO_URL}[/dim]  ·  [dim]Proxy:[/dim] {proxy_str}"
     if _session_stats["scraped"] > 0:
         status += f"  ·  [dim]Scraped:[/dim] [white]{_session_stats['scraped']}[/white]"
     console.print(status, justify="center")
@@ -470,8 +474,8 @@ def show_menu():
 def _get_delay_range(fallback=(1.0, 2.5)):
     """Get configured delay range from env vars, with fallback."""
     try:
-        d_min = float(os.environ.get('SCOUT_DELAY_MIN', str(fallback[0])))
-        d_max = float(os.environ.get('SCOUT_DELAY_MAX', str(fallback[1])))
+        d_min = float(os.environ.get('VERTEX_DELAY_MIN', os.environ.get('SCOUT_DELAY_MIN', str(fallback[0]))))
+        d_max = float(os.environ.get('VERTEX_DELAY_MAX', os.environ.get('SCOUT_DELAY_MAX', str(fallback[1]))))
         return (d_min, d_max) if d_max >= d_min >= 0 else fallback
     except ValueError:
         return fallback
@@ -519,6 +523,53 @@ def _standard_scrape_loop(scraper_func, items, label_prefix="@", delay_range=Non
     return profiles
 
 
+def _flatten_profile(profile: dict) -> dict:
+    """Drop nested lists/dicts so CSV rows stay one-dimensional."""
+    flat = {}
+    for key, value in profile.items():
+        if key in ('links',):
+            if isinstance(value, list):
+                urls = []
+                for item in value:
+                    if isinstance(item, dict):
+                        urls.append(item.get('url', ''))
+                    elif item:
+                        urls.append(str(item))
+                flat['links'] = ' | '.join(u for u in urls if u)
+            continue
+        if key == 'socials' and isinstance(value, dict):
+            for platform, handle in value.items():
+                if handle:
+                    flat[f'social_{platform}'] = handle
+            continue
+        if isinstance(value, (list, dict)):
+            continue
+        flat[key] = value
+    return flat
+
+
+def _export_dir() -> Path:
+    out = Path('exports')
+    out.mkdir(exist_ok=True)
+    return out
+
+
+def _write_csv(filename: Path, profiles: list) -> Path:
+    rows = [_flatten_profile(p) for p in profiles]
+    keys = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    with open(filename, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=keys, extrasaction='ignore')
+        writer.writeheader()
+        writer.writerows(rows)
+    return filename
+
+
 def _standard_export(profiles, total, platform_name, item_type="profiles"):
     """Shared post-scrape: summary, enrichment, CSV export."""
     if profiles:
@@ -526,13 +577,9 @@ def _standard_export(profiles, total, platform_name, item_type="profiles"):
         profiles = enrich_profiles(profiles)
         if Confirm.ask("[+] Export to CSV?", default=True):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"{platform_name}_export_{timestamp}.csv"
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                if profiles:
-                    writer = csv.DictWriter(f, fieldnames=profiles[0].keys())
-                    writer.writeheader()
-                    writer.writerows(profiles)
-            _export_result(filename, len(profiles), item_type)
+            filename = _export_dir() / f"{platform_name}_export_{timestamp}.csv"
+            _write_csv(filename, profiles)
+            _export_result(str(filename), len(profiles), item_type)
     else:
         _no_results()
 
@@ -594,7 +641,7 @@ def scrape_linkedin_interactive():
         console.print("  [white]2.[/white] F12 > Application > Cookies > linkedin.com")
         console.print("  [white]3.[/white] Copy the value of [bold]li_at[/bold]")
         console.print("  [white]4.[/white] Add to .env: [bold]LINKEDIN_COOKIE=your_value[/bold]")
-        console.print("  [white]5.[/white] Restart Scout")
+        console.print("  [white]5.[/white] Restart Vertex")
         console.print()
         return
 
@@ -700,25 +747,9 @@ def scrape_linktree_interactive():
         profiles = enrich_profiles(profiles)
         if Confirm.ask("[+] Export to CSV?", default=True):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"{platform_name}_export_{timestamp}.csv"
-
-            export_profiles = []
-            for p in profiles:
-                flat = {k: v for k, v in p.items() if k not in ['links', 'socials']}
-                if p.get('socials'):
-                    for platform, handle in p['socials'].items():
-                        flat[f'social_{platform}'] = handle
-                export_profiles.append(flat)
-
-            with open(filename, 'w', newline='', encoding='utf-8') as f:
-                if export_profiles:
-                    all_keys = set()
-                    for p in export_profiles:
-                        all_keys.update(p.keys())
-                    writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
-                    writer.writeheader()
-                    writer.writerows(export_profiles)
-            _export_result(filename, len(profiles))
+            filename = _export_dir() / f"{platform_name}_export_{timestamp}.csv"
+            _write_csv(filename, profiles)
+            _export_result(str(filename), len(profiles))
     else:
         _no_results()
 
@@ -855,17 +886,13 @@ def scrape_from_file():
         console.print()
 
         if profiles:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            export_filename = f"{platform_key}_export_{timestamp}.csv"
-
-            with open(export_filename, 'w', newline='', encoding='utf-8') as f:
-                if profiles:
-                    writer = csv.DictWriter(f, fieldnames=profiles[0].keys())
-                    writer.writeheader()
-                    writer.writerows(profiles)
-
             _success_summary(successful, len(usernames))
-            _export_result(export_filename, successful)
+            profiles = enrich_profiles(profiles)
+            if Confirm.ask("[+] Export to CSV?", default=True):
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                export_filename = _export_dir() / f"{platform_key}_export_{timestamp}.csv"
+                _write_csv(export_filename, profiles)
+                _export_result(str(export_filename), len(profiles))
         else:
             _no_results()
 
@@ -875,16 +902,27 @@ def scrape_from_file():
         console.print(f"\n[red]✗ Error: {e}[/red]")
 
 
+def _listed_exports():
+    files = list(Path('.').glob('*_export_*.csv'))
+    export_dir = Path('exports')
+    if export_dir.is_dir():
+        files.extend(export_dir.glob('*_export_*.csv'))
+    files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return files
+
+
 def settings_menu():
-    _platform_header("Settings", "Configure Scout")
+    _platform_header("Settings", "Configure Vertex")
 
     ps = proxy_status()
-    current_proxy = os.environ.get('SCOUT_PROXY', '')
-    free_enabled = os.environ.get('SCOUT_FREE_PROXY', '').lower() in ('1', 'true', 'yes')
-    proxy_file = os.environ.get('SCOUT_PROXY_FILE', '')
-    delay_min = os.environ.get('SCOUT_DELAY_MIN', '1.0')
-    delay_max = os.environ.get('SCOUT_DELAY_MAX', '2.5')
+    current_proxy = os.environ.get('VERTEX_PROXY') or os.environ.get('SCOUT_PROXY', '')
+    free_enabled = (os.environ.get('VERTEX_FREE_PROXY') or os.environ.get('SCOUT_FREE_PROXY', '')).lower() in ('1', 'true', 'yes')
+    proxy_file = os.environ.get('VERTEX_PROXY_FILE') or os.environ.get('SCOUT_PROXY_FILE', '')
+    delay_min = os.environ.get('VERTEX_DELAY_MIN') or os.environ.get('SCOUT_DELAY_MIN', '1.0')
+    delay_max = os.environ.get('VERTEX_DELAY_MAX') or os.environ.get('SCOUT_DELAY_MAX', '2.5')
     li_cookie = os.environ.get('LINKEDIN_COOKIE', '').strip()
+    gh_token = os.environ.get('GITHUB_TOKEN', '').strip()
+    hunter_key = os.environ.get('HUNTER_API_KEY', '').strip()
 
     proxy_str = f"[green]{ps}[/green]" if ps != 'none' else "[red]off[/red]"
     if current_proxy:
@@ -896,6 +934,8 @@ def settings_menu():
     console.print(f"  [dim]Free proxy:[/dim] [green]on[/green]" if free_enabled else f"  [dim]Free proxy:[/dim] [dim]off[/dim]")
     console.print(f"  [dim]Delay:[/dim]     [white]{delay_min}s - {delay_max}s[/white]")
     console.print(f"  [dim]LinkedIn:[/dim]  [green]cookie set[/green]" if li_cookie else f"  [dim]LinkedIn:[/dim]  [dim]not configured[/dim]")
+    console.print(f"  [dim]GitHub:[/dim]    [green]token set[/green]" if gh_token else f"  [dim]GitHub:[/dim]    [dim]unauthenticated[/dim]")
+    console.print(f"  [dim]Hunter:[/dim]    [green]key set[/green]" if hunter_key else f"  [dim]Hunter:[/dim]    [dim]not configured[/dim]")
     console.print(f"  [dim]Scraped:[/dim]   [white]{_session_stats['scraped']}[/white] [dim]this session[/dim]")
     console.print()
 
@@ -912,39 +952,41 @@ def settings_menu():
     console.print()
     console.print(f"  [{ACCENT}][6][/{ACCENT}]  Set scrape delay")
     console.print(f"  [{ACCENT}][7][/{ACCENT}]  Set LinkedIn cookie")
+    console.print(f"  [{ACCENT}][8][/{ACCENT}]  Set GitHub token")
+    console.print(f"  [{ACCENT}][9][/{ACCENT}]  Set Hunter.io key")
     console.print()
 
     console.print(Rule("[bold white]Data[/bold white]", style=ACCENT_DIM, align="left"))
     console.print()
-    console.print(f"  [{ACCENT}][8][/{ACCENT}]  Clear all exports")
+    console.print(f"  [{ACCENT}][10][/{ACCENT}] Clear all exports")
     console.print(f"  [{ACCENT}][0][/{ACCENT}]  Back to menu")
     console.print()
 
-    choice = Prompt.ask(f"[{ACCENT}]>[/{ACCENT}]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
+    choice = Prompt.ask(f"[{ACCENT}]>[/{ACCENT}]", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"], default="0")
 
     import httpx as _httpx
 
     if choice == '1':
         url = Prompt.ask("[>] Proxy URL (e.g. http://user:pass@host:port)")
         if url.strip():
-            _update_env('SCOUT_PROXY', url.strip())
+            _update_env('VERTEX_PROXY', url.strip())
             console.print(f"[green]✓ Proxy set[/green]")
 
     elif choice == '2':
         filepath = Prompt.ask("[>] Path to proxy list file")
         if filepath.strip():
             if os.path.exists(filepath.strip()):
-                _update_env('SCOUT_PROXY_FILE', filepath.strip())
+                _update_env('VERTEX_PROXY_FILE', filepath.strip())
                 console.print(f"[green]✓ Proxy file set[/green]")
             else:
                 console.print(f"[red]✗ File not found: {filepath.strip()}[/red]")
 
     elif choice == '3':
         if free_enabled:
-            _update_env('SCOUT_FREE_PROXY', 'false')
+            _update_env('VERTEX_FREE_PROXY', 'false')
             console.print("[yellow]✓ Free proxy disabled[/yellow]")
         else:
-            _update_env('SCOUT_FREE_PROXY', 'true')
+            _update_env('VERTEX_FREE_PROXY', 'true')
             console.print("[green]✓ Free proxy enabled[/green]")
 
     elif choice == '4':
@@ -963,7 +1005,7 @@ def settings_menu():
             console.print(f"[dim]Trying: {px[:60]}[/dim]")
             proxy_url = px if px.startswith('http') else f'http://{px}'
             try:
-                resp = _httpx.get('https://httpbin.org/ip', proxy=proxy_url, timeout=10, verify=False)
+                resp = _httpx.get('https://httpbin.org/ip', proxy=proxy_url, timeout=10)
                 ip = resp.json().get('origin', '?')
                 console.print(f"[green]✓ Proxy works! IP: {ip}[/green]")
             except Exception as e:
@@ -976,7 +1018,7 @@ def settings_menu():
                         p_url = p if p.startswith('http') else f'http://{p}'
                         console.print(f"[dim]Trying: {p_url[:60]}[/dim]")
                         try:
-                            resp = _httpx.get('https://httpbin.org/ip', proxy=p_url, timeout=8, verify=False)
+                            resp = _httpx.get('https://httpbin.org/ip', proxy=p_url, timeout=8)
                             ip = resp.json().get('origin', '?')
                             console.print(f"[green]✓ Found working proxy! IP: {ip}[/green]")
                             break
@@ -986,11 +1028,11 @@ def settings_menu():
                         console.print("[red]All free proxies failed. Use a paid proxy.[/red]")
 
     elif choice == '5':
-        _update_env('SCOUT_PROXY', '')
-        _update_env('SCOUT_FREE_PROXY', 'false')
-        _update_env('SCOUT_PROXY_FILE', '')
-        os.environ.pop('SCOUT_PROXY', None)
-        os.environ.pop('SCOUT_PROXY_FILE', None)
+        _update_env('VERTEX_PROXY', '')
+        _update_env('VERTEX_FREE_PROXY', 'false')
+        _update_env('VERTEX_PROXY_FILE', '')
+        for key in ('VERTEX_PROXY', 'VERTEX_PROXY_FILE', 'SCOUT_PROXY', 'SCOUT_PROXY_FILE'):
+            os.environ.pop(key, None)
         console.print("[yellow]✓ Proxy removed[/yellow]")
 
     elif choice == '6':
@@ -1002,8 +1044,8 @@ def settings_menu():
             if fmin < 0 or fmax < fmin:
                 console.print("[red]✗ Invalid range[/red]")
             else:
-                _update_env('SCOUT_DELAY_MIN', str(fmin))
-                _update_env('SCOUT_DELAY_MAX', str(fmax))
+                _update_env('VERTEX_DELAY_MIN', str(fmin))
+                _update_env('VERTEX_DELAY_MAX', str(fmax))
                 console.print(f"[green]✓ Delay set to {fmin}s - {fmax}s[/green]")
         except ValueError:
             console.print("[red]✗ Must be numbers[/red]")
@@ -1017,7 +1059,21 @@ def settings_menu():
             console.print("[green]✓ LinkedIn cookie saved[/green]")
 
     elif choice == '8':
-        csv_files = list(Path('.').glob('*_export_*.csv'))
+        console.print("[white]Paste a GitHub personal access token (public_repo is enough):[/white]")
+        token = Prompt.ask("[>] token", default="")
+        if token.strip():
+            _update_env('GITHUB_TOKEN', token.strip())
+            console.print("[green]✓ GitHub token saved[/green]")
+
+    elif choice == '9':
+        console.print("[white]Paste your Hunter.io API key:[/white]")
+        key = Prompt.ask("[>] key", default="")
+        if key.strip():
+            _update_env('HUNTER_API_KEY', key.strip())
+            console.print("[green]✓ Hunter.io key saved[/green]")
+
+    elif choice == '10':
+        csv_files = _listed_exports()
         if not csv_files:
             console.print("[yellow]No exports to clear[/yellow]")
         else:
@@ -1028,18 +1084,15 @@ def settings_menu():
                 console.print(f"[green]✓ Deleted {len(csv_files)} exports[/green]")
 
 
-
 def view_exports():
     _platform_header("Exports", "Your scraped data")
 
-    csv_files = list(Path('.').glob('*_export_*.csv'))
+    csv_files = _listed_exports()
 
     if not csv_files:
         console.print("  [yellow]No exports found yet[/yellow]")
         console.print("  [dim]Run a scrape to create your first export[/dim]")
         return
-
-    csv_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
 
     table = Table(box=box.MINIMAL_HEAVY_HEAD, border_style="dim", padding=(0, 1))
     table.add_column("#", style="dim", width=4)
@@ -1050,7 +1103,7 @@ def view_exports():
     for i, file in enumerate(csv_files[:10], 1):
         size = file.stat().st_size / 1024
         mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(file.stat().st_mtime))
-        table.add_row(str(i), file.name, f"{size:.1f} KB", mtime)
+        table.add_row(str(i), str(file), f"{size:.1f} KB", mtime)
 
     console.print(table)
     console.print(f"  [dim]{len(csv_files)} exports total[/dim]")
@@ -1065,17 +1118,10 @@ def main():
 
     latest = _update_cache.get("latest")
     if latest:
+        console.print(
+            f"  [dim]v{latest} is out — git pull origin main  ({REPO_URL})[/dim]"
+        )
         console.print()
-        console.print(Panel(
-            f"[bold white]Scout v{latest} is available.[/bold white]\n"
-            f"[dim]You are running v{__version__}. Please update before continuing.[/dim]\n\n"
-            f"[{ACCENT}]git pull origin main[/{ACCENT}]  [dim]or visit[/dim]  [{ACCENT}]github.com/kiryano/Scout[/{ACCENT}]",
-            border_style=ACCENT,
-            title="[bold white]Update Required[/bold white]",
-            padding=(1, 3),
-        ))
-        console.print()
-        sys.exit(1)
 
     while True:
         show_menu()
@@ -1093,8 +1139,8 @@ def main():
                 console.print()
                 console.print(Rule(style=ACCENT_DIM))
                 console.print(
-                    f"  [bold {ACCENT}]Thanks for using Scout[/bold {ACCENT}]  "
-                    "[dim]★ github.com/kiryano/Scout[/dim]"
+                    f"  [bold {ACCENT}]Thanks for using Vertex[/bold {ACCENT}]  "
+                    f"[dim]{REPO_URL}[/dim]"
                 )
                 console.print()
                 break
