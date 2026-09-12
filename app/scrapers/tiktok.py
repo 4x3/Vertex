@@ -1,25 +1,14 @@
 import json
 import logging
 import re
-from datetime import datetime
 from typing import Dict, Optional
 
 import httpx
 
-from app.scrapers.stealth import random_user_agent, get_httpx_proxy
-from app.scrapers.utils import extract_email
+from app.scrapers.stealth import random_user_agent, make_client
+from app.scrapers.utils import extract_email, extract_phone
 
 logger = logging.getLogger(__name__)
-
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        proxy = get_httpx_proxy()
-        _client = httpx.Client(follow_redirects=True, timeout=20, proxy=proxy)
-    return _client
 
 
 def _build_headers() -> dict:
@@ -27,7 +16,6 @@ def _build_headers() -> dict:
         'User-Agent': random_user_agent(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'none',
         'Sec-Fetch-Dest': 'document',
@@ -38,21 +26,24 @@ def _build_headers() -> dict:
 
 def scrape_tiktok_profile(username: str) -> Optional[Dict]:
     """Scrape TikTok profile. Returns profile dict or None."""
+    username = username.lstrip('@').strip()
     url = f'https://www.tiktok.com/@{username}'
     logger.info(f"Scraping TikTok profile: {url}")
 
     try:
-        client = _get_client()
-        resp = client.get(url, headers=_build_headers())
-        resp.raise_for_status()
+        with make_client() as client:
+            resp = client.get(url, headers=_build_headers())
+            if resp.status_code == 404:
+                logger.debug(f"TikTok user @{username} not found")
+                return None
+            resp.raise_for_status()
+            html = resp.text
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error for @{username}: {e.response.status_code}")
         return None
     except httpx.RequestError as e:
         logger.error(f"Request error for @{username}: {e}")
         return None
-
-    html = resp.text
 
     match = re.search(
         r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
@@ -70,12 +61,15 @@ def scrape_tiktok_profile(username: str) -> Optional[Dict]:
         return None
 
     try:
-        user_detail = data['__DEFAULT_SCOPE__']['webapp.user-detail']
-        user_info = user_detail['userInfo']
+        user_detail = data.get('__DEFAULT_SCOPE__', {}).get('webapp.user-detail', {})
+        user_info = user_detail.get('userInfo', {})
         user = user_info.get('user', {})
         stats = user_info.get('stats', {})
     except (KeyError, TypeError) as e:
         logger.error(f"Unexpected JSON structure for @{username}: {e}")
+        return None
+
+    if not user:
         return None
 
     bio = user.get('signature', '')
@@ -86,6 +80,7 @@ def scrape_tiktok_profile(username: str) -> Optional[Dict]:
         'full_name': user.get('nickname', ''),
         'bio': bio,
         'email': extract_email(bio),
+        'phone': extract_phone(bio),
         'profile_url': url,
         'is_verified': user.get('verified', False),
         'follower_count': stats.get('followerCount', 0),

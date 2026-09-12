@@ -2,21 +2,25 @@
 Instagram Profile Scraper
 
 Scrapes public Instagram profiles by parsing the HTML page directly.
-Uses mobile user agents and rotating residential proxies to avoid rate limits.
+Uses mobile user agents and rotating proxies to avoid rate limits.
 
 Features:
 - Extracts follower/following counts, bio, verification status, etc.
-- Multiple regex patterns to handle Instagram's varying HTML structures
+- Tries embedded JSON first, then regex fallbacks
 - Automatic retry with proxy rotation on extraction failures
 - No authentication required (public profiles only)
 """
 
-import requests
-from typing import Dict, Optional
+import json
 import logging
+import random
 import re
+import time
+from typing import Dict, Optional
 
-from app.scrapers.stealth import get_requests_proxies
+import httpx
+
+from app.scrapers.stealth import make_client
 from app.scrapers.utils import extract_email, extract_phone, parse_abbreviated_number
 
 logger = logging.getLogger(__name__)
@@ -45,57 +49,62 @@ def _is_page_not_found(html: str) -> bool:
 
 def scrape_profile_no_login(username: str, max_retries: int = 3) -> Optional[Dict]:
     """Scrape Instagram profile using mobile web HTML parsing (no API)."""
-    import random
-    import time
-
     url = f'https://www.instagram.com/{username}/'
 
     for attempt in range(max_retries):
-        proxies = get_requests_proxies()
-
         headers = {
             'User-Agent': random.choice(MOBILE_USER_AGENTS),
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
         }
 
         try:
-            r = requests.get(url, headers=headers, proxies=proxies, timeout=20)
+            with make_client() as client:
+                r = client.get(url, headers=headers)
 
-            if r.status_code == 404:
-                return None
+                if r.status_code == 404:
+                    return None
 
-            if r.status_code == 429:
-                raise RuntimeError("Rate limited by Instagram (429). Wait a few minutes before scraping again.")
+                if r.status_code == 429:
+                    raise RuntimeError("Rate limited by Instagram (429). Wait a few minutes before scraping again.")
 
-            if r.status_code != 200:
-                logger.debug(f"HTTP {r.status_code} for @{username}, attempt {attempt + 1}/{max_retries}")
+                if r.status_code != 200:
+                    logger.debug(f"HTTP {r.status_code} for @{username}, attempt {attempt + 1}/{max_retries}")
+                    if attempt < max_retries - 1:
+                        time.sleep(random.uniform(1.5, 3.0))
+                        continue
+                    return None
+
+                html = r.text
+
+                if _is_page_not_found(html):
+                    return None
+
+                if '/accounts/login' in str(r.url) or (
+                    'login' in html[:5000].lower() and 'password' in html[:5000].lower()
+                ):
+                    logger.debug(f"Hit Instagram login wall for @{username}")
+                    if attempt < max_retries - 1:
+                        time.sleep(random.uniform(2.0, 4.0))
+                        continue
+                    return None
+
+                data = _extract_profile_from_html(html, username)
+                if data:
+                    return data
+
                 if attempt < max_retries - 1:
-                    time.sleep(1)
+                    logger.debug(f"Extraction failed for @{username}, retrying ({attempt + 1}/{max_retries})")
+                    time.sleep(random.uniform(1.0, 2.5))
                     continue
+
                 return None
 
-            html = r.text
-
-            if _is_page_not_found(html):
-                return None
-
-            if '/accounts/login' in r.url or ('login' in html[:5000].lower() and 'password' in html[:5000].lower()):
-                return None
-
-            data = _extract_profile_from_html(html, username)
-
-            if data:
-                return data
-
-            if attempt < max_retries - 1:
-                logger.debug(f"Extraction failed for @{username}, retrying ({attempt + 1}/{max_retries})")
-                time.sleep(1.0)
-                continue
-
-            return None
-
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             logger.debug(f"Timeout for @{username}, attempt {attempt + 1}/{max_retries}")
             if attempt < max_retries - 1:
                 time.sleep(1)
@@ -116,132 +125,185 @@ def scrape_profile_no_login(username: str, max_retries: int = 3) -> Optional[Dic
     return None
 
 
+def _clean_unicode(text: str) -> str:
+    try:
+        decoded = text.encode('utf-8').decode('unicode_escape')
+        return decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return text.replace('\\/', '/').replace('\\u', '')
+
+
+def _extract_json_user(html: str, username: str) -> dict:
+    """Pull a user object out of the page if Instagram embedded one."""
+    needle = f'"username":"{username}"'
+    idx = html.lower().find(needle.lower())
+    if idx == -1:
+        needle = f'"username": "{username}"'
+        idx = html.lower().find(needle.lower())
+    if idx == -1:
+        return {}
+
+    start = html.rfind('{', 0, idx)
+    if start == -1:
+        return {}
+
+    depth = 0
+    for i, char in enumerate(html[start:], start):
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                try:
+                    obj = json.loads(html[start:i + 1])
+                except json.JSONDecodeError:
+                    return {}
+                if str(obj.get('username', '')).lower() != username.lower():
+                    return {}
+                return obj
+    return {}
+
+
 def _extract_profile_from_html(html: str, username: str) -> Optional[Dict]:
     """Extract profile data from Instagram HTML page."""
-
     results = {}
 
-    username_patterns = [
-        r'"username":"([^"]+)"',
-        r'"owner":\{"username":"([^"]+)"',
-        r'instagram\.com/([a-zA-Z0-9_.]+)/"\s*>',
-    ]
-    for pattern in username_patterns:
-        match = re.search(pattern, html)
-        if match and match.group(1).lower() == username.lower():
-            results['username'] = match.group(1)
-            break
+    user_obj = _extract_json_user(html, username)
+    if user_obj:
+        results['username'] = user_obj.get('username', username)
+        results['full_name'] = user_obj.get('full_name', '')
+        results['biography'] = user_obj.get('biography', '')
+        results['follower_count'] = (
+            (user_obj.get('edge_followed_by') or {}).get('count')
+            or user_obj.get('follower_count')
+        )
+        results['following_count'] = (
+            (user_obj.get('edge_follow') or {}).get('count')
+            or user_obj.get('following_count')
+        )
+        results['media_count'] = (
+            (user_obj.get('edge_owner_to_timeline_media') or {}).get('count')
+            or user_obj.get('media_count')
+        )
+        results['is_verified'] = user_obj.get('is_verified', False)
+        results['is_private'] = user_obj.get('is_private', False)
+        results['is_business'] = user_obj.get('is_business_account', False)
+        results['external_url'] = user_obj.get('external_url', '') or ''
 
-    name_patterns = [
-        r'"full_name":"([^"]*)"',
-        r'"name":"([^"]*)"',
-        r'<title>([^(<]+)\s*\(@' + re.escape(username) + r'\)',
-    ]
-    for pattern in name_patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match and 'full_name' not in results:
-            results['full_name'] = match.group(1).strip()
-            break
+    if 'username' not in results:
+        username_patterns = [
+            r'"username":"([^"]+)"',
+            r'"owner":\{"username":"([^"]+)"',
+            r'instagram\.com/([a-zA-Z0-9_.]+)/"\s*>',
+        ]
+        for pattern in username_patterns:
+            match = re.search(pattern, html)
+            if match and match.group(1).lower() == username.lower():
+                results['username'] = match.group(1)
+                break
 
-    bio_patterns = [
-        r'"biography":"([^"]*)"',
-        r'"bio":"([^"]*)"',
-        r'"description":"([^"]*)"',
-    ]
-    for pattern in bio_patterns:
-        match = re.search(pattern, html)
-        if match and 'biography' not in results:
-            try:
-                decoded = match.group(1).encode('utf-8').decode('unicode_escape')
-                results['biography'] = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                results['biography'] = match.group(1).replace('\\u', '')
-            break
+    if 'full_name' not in results or not results.get('full_name'):
+        name_patterns = [
+            r'"full_name":"([^"]*)"',
+            r'"name":"([^"]*)"',
+            r'<title>([^(<]+)\s*\(@' + re.escape(username) + r'\)',
+        ]
+        for pattern in name_patterns:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                results['full_name'] = _clean_unicode(match.group(1).strip())
+                break
 
-    follower_patterns = [
-        r'"follower_count":(\d+)',
-        r'"edge_followed_by":\{"count":(\d+)\}',
-        r'"userInteractionCount":"?(\d+)"?.*?[Ff]ollow',
-        r'followers["\s:]+(\d+)',
-    ]
-    for pattern in follower_patterns:
-        match = re.search(pattern, html)
-        if match and 'follower_count' not in results:
-            results['follower_count'] = int(match.group(1))
-            break
+    if 'biography' not in results:
+        bio_patterns = [
+            r'"biography":"([^"]*)"',
+            r'"bio":"([^"]*)"',
+            r'"description":"([^"]*)"',
+        ]
+        for pattern in bio_patterns:
+            match = re.search(pattern, html)
+            if match:
+                results['biography'] = _clean_unicode(match.group(1))
+                break
 
-    following_patterns = [
-        r'"following_count":(\d+)',
-        r'"edge_follow":\{"count":(\d+)\}',
-    ]
-    for pattern in following_patterns:
-        match = re.search(pattern, html)
-        if match and 'following_count' not in results:
-            results['following_count'] = int(match.group(1))
-            break
+    if not results.get('follower_count'):
+        follower_patterns = [
+            r'"follower_count":(\d+)',
+            r'"edge_followed_by":\{"count":(\d+)\}',
+            r'"userInteractionCount":"?(\d+)"?.*?[Ff]ollow',
+            r'followers["\s:]+(\d+)',
+        ]
+        for pattern in follower_patterns:
+            match = re.search(pattern, html)
+            if match:
+                results['follower_count'] = int(match.group(1))
+                break
 
-    media_patterns = [
-        r'"media_count":(\d+)',
-        r'"edge_owner_to_timeline_media":\{"count":(\d+)\}',
-    ]
-    for pattern in media_patterns:
-        match = re.search(pattern, html)
-        if match and 'media_count' not in results:
-            results['media_count'] = int(match.group(1))
-            break
+    if not results.get('following_count'):
+        following_patterns = [
+            r'"following_count":(\d+)',
+            r'"edge_follow":\{"count":(\d+)\}',
+        ]
+        for pattern in following_patterns:
+            match = re.search(pattern, html)
+            if match:
+                results['following_count'] = int(match.group(1))
+                break
 
-    meta_patterns = [
-        r'content="([\d.,]+[KMB]?)\s*Followers?,\s*([\d.,]+[KMB]?)\s*Following,\s*([\d.,]+[KMB]?)\s*Posts?',
-        r'([\d.,]+[KMB]?)\s*Followers?\s*[,·]\s*([\d.,]+[KMB]?)\s*Following\s*[,·]\s*([\d.,]+[KMB]?)\s*Posts?',
-    ]
-    for pattern in meta_patterns:
-        meta_match = re.search(pattern, html, re.IGNORECASE)
-        if meta_match:
-            if 'follower_count' not in results:
-                results['follower_count'] = _parse_abbreviated_number(meta_match.group(1))
-            if 'following_count' not in results:
-                results['following_count'] = _parse_abbreviated_number(meta_match.group(2))
-            if 'media_count' not in results:
-                results['media_count'] = _parse_abbreviated_number(meta_match.group(3))
-            break
+    if not results.get('media_count'):
+        media_patterns = [
+            r'"media_count":(\d+)',
+            r'"edge_owner_to_timeline_media":\{"count":(\d+)\}',
+        ]
+        for pattern in media_patterns:
+            match = re.search(pattern, html)
+            if match:
+                results['media_count'] = int(match.group(1))
+                break
 
-    verified_patterns = [
-        r'"is_verified":(true|false)',
-        r'"verified":(true|false)',
-    ]
-    for pattern in verified_patterns:
-        match = re.search(pattern, html)
+    if not all(results.get(k) for k in ('follower_count', 'following_count', 'media_count')):
+        meta_patterns = [
+            r'content="([\d.,]+[KMB]?)\s*Followers?,\s*([\d.,]+[KMB]?)\s*Following,\s*([\d.,]+[KMB]?)\s*Posts?',
+            r'([\d.,]+[KMB]?)\s*Followers?\s*[,·]\s*([\d.,]+[KMB]?)\s*Following\s*[,·]\s*([\d.,]+[KMB]?)\s*Posts?',
+        ]
+        for pattern in meta_patterns:
+            meta_match = re.search(pattern, html, re.IGNORECASE)
+            if meta_match:
+                results.setdefault('follower_count', parse_abbreviated_number(meta_match.group(1)))
+                results.setdefault('following_count', parse_abbreviated_number(meta_match.group(2)))
+                results.setdefault('media_count', parse_abbreviated_number(meta_match.group(3)))
+                break
+
+    if 'is_verified' not in results:
+        match = re.search(r'"is_verified":(true|false)', html)
         if match:
             results['is_verified'] = match.group(1) == 'true'
-            break
 
-    match = re.search(r'"is_private":(true|false)', html)
-    if match:
-        results['is_private'] = match.group(1) == 'true'
+    if 'is_private' not in results:
+        match = re.search(r'"is_private":(true|false)', html)
+        if match:
+            results['is_private'] = match.group(1) == 'true'
 
-    match = re.search(r'"is_business_account":(true|false)', html)
-    if match:
-        results['is_business'] = match.group(1) == 'true'
+    if 'is_business' not in results:
+        match = re.search(r'"is_business_account":(true|false)', html)
+        if match:
+            results['is_business'] = match.group(1) == 'true'
 
-    url_patterns = [
-        r'"external_url":"([^"]+)"',
-        r'"website":"([^"]+)"',
-        r'"url":"(https?://[^"]+)"',
-    ]
-    for pattern in url_patterns:
-        match = re.search(pattern, html)
-        if match and 'external_url' not in results:
-            try:
-                decoded = match.group(1).replace('\\/', '/').encode('utf-8').decode('unicode_escape')
-                results['external_url'] = decoded.encode('utf-16', 'surrogatepass').decode('utf-16')
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                results['external_url'] = match.group(1).replace('\\/', '/')
-            break
+    if not results.get('external_url'):
+        url_patterns = [
+            r'"external_url":"([^"]+)"',
+            r'"website":"([^"]+)"',
+        ]
+        for pattern in url_patterns:
+            match = re.search(pattern, html)
+            if match:
+                results['external_url'] = _clean_unicode(match.group(1).replace('\\/', '/'))
+                break
 
-    if 'follower_count' not in results or results.get('follower_count', 0) == 0:
+    if not results.get('follower_count'):
         return None
 
-    bio = results.get('biography', '')
+    bio = results.get('biography', '') or ''
 
     return {
         'username': results.get('username', username),
@@ -254,8 +316,8 @@ def _extract_profile_from_html(html: str, username: str) -> Optional[Dict]:
         'is_private': results.get('is_private', False),
         'is_business': results.get('is_business', False),
         'website': results.get('external_url', ''),
-        'email': _extract_email(bio),
-        'phone': _extract_phone(bio),
+        'email': extract_email(bio),
+        'phone': extract_phone(bio),
         'platform': 'instagram',
         'profile_url': f'https://www.instagram.com/{username}/',
     }
